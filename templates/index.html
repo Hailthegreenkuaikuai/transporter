@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Transporter</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --line:#e3e5e8; --text:#1c1e21; --muted:#6b7280; --accent:#2563eb; }
+  * { box-sizing:border-box; }
+  body { font-family:system-ui,"Segoe UI",sans-serif; background:var(--bg); color:var(--text);
+         margin:0; padding:24px; display:flex; flex-direction:column; align-items:center; }
+  h1 { font-size:20px; margin:0 0 4px; text-align:center; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 16px; text-align:center; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px;
+          margin-bottom:16px; width:100%; max-width:640px; }
+  .lbl { color:var(--muted); font-size:12px; margin-bottom:6px; }
+  textarea { width:100%; height:84px; resize:vertical; padding:8px; border:1px solid var(--line); border-radius:6px; }
+  input[type=text], select { padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
+  button { padding:7px 14px; border:1px solid var(--line); border-radius:6px; background:#fff; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.mini { padding:2px 8px; font-size:12px; }
+  .row { display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:12px; }
+  .url-list .row input { flex:1; min-width:200px; }
+  .bar { height:8px; background:#e9ebee; border-radius:4px; overflow:hidden; margin-top:6px; }
+  .bar > div { height:100%; background:var(--accent); width:0; transition:width .3s; }
+  .job { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px; }
+  .error { color:#dc2626; font-size:13px; white-space:pre-wrap; }
+  .files { font-size:12px; color:var(--muted); word-break:break-all; white-space:pre-wrap; }
+  .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line);
+          border-radius:999px; padding:3px 10px; font-size:12px; margin:0 6px 6px 0; background:var(--bg); }
+  footer { color:var(--muted); font-size:12px; margin-top:16px; }
+</style>
+</head>
+<body>
+<h1>Video Transporter</h1>
+<p class="sub">Paste share text &rarr; strip URLs &rarr; download with yt-dlp.</p>
+
+<div class="card">
+  <div class="lbl">1 &middot; Paste share text (douyin, bilibili, &hellip;) &mdash; paste several texts to queue multiple videos</div>
+  <textarea id="paste" placeholder="Paste share text here, e.g. douyin's 复制此链接 message&hellip;"></textarea>
+  <div class="row">
+    <button id="extract">Add URLs from text</button>
+    <button id="clear">Clear</button>
+    <span id="urlCount" class="muted"></span>
+  </div>
+  <div class="url-list" id="urlList"></div>
+  <div class="row">
+    <input type="text" id="newUrl" placeholder="Or add a URL manually" style="flex:1">
+    <button id="addUrl">+</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="lbl">2 &middot; Download settings</div>
+  <div class="row">
+    <span class="muted" id="baseLabel">Base folder: loading&hellip;</span>
+    <button id="chooseBase">Choose base folder&hellip;</button>
+  </div>
+  <div class="row">
+    <select id="dirSel"></select>
+    <input type="text" id="newDir" placeholder="New folder (e.g. Music &rarr; D:/Transport/Music)">
+    <button id="addDir">Add</button>
+  </div>
+  <div id="dirList"></div>
+  <div class="row">
+    <select id="browser">
+      <option value="opera">opera</option>
+      <option value="edge">edge</option>
+      <option value="chrome">chrome</option>
+    </select>
+    <label><input type="checkbox" id="useCookies" checked> use cookies</label>
+    <button id="download" class="primary">Download</button>
+  </div>
+  <div class="row">
+    <span class="muted" id="cookieStatus">checking cookies…</span>
+    <button id="exportCookies">Export cookies</button>
+  </div>
+  <p class="muted" id="cookieNote"></p>
+</div>
+
+<div class="card">
+  <div class="lbl">3 &middot; Progress</div>
+  <div id="jobs"></div>
+</div>
+
+<div class="card">
+  <div class="lbl">Recent downloads</div>
+  <div id="history" class="files"></div>
+</div>
+
+<footer>run: <code>python app.py</code> &middot; config saved to config.json</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let urls = [];
+
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({'Content-Type': 'application/json'}, opts.headers);
+  const r = await fetch(path, opts);
+  return r.json();
+}
+
+function renderUrls() {
+  $('urlList').innerHTML = '';
+  urls.forEach((u, i) => {
+    const row = document.createElement('div'); row.className = 'row';
+    const inp = document.createElement('input'); inp.type = 'text'; inp.value = u;
+    inp.onchange = () => { urls[i] = inp.value.trim(); };
+    const del = document.createElement('button'); del.className = 'mini'; del.textContent = '✕';
+    del.onclick = () => { urls.splice(i, 1); renderUrls(); };
+    row.append(inp, del);
+    $('urlList').append(row);
+  });
+  $('urlCount').textContent = urls.length ? urls.length + ' URL(s)' : '';
+}
+
+async function extract() {
+  const r = await api('/api/extract', { method: 'POST', body: JSON.stringify({ text: $('paste').value }) });
+  urls = Array.from(new Set(urls.concat(r.urls)));  // accumulate across pastes
+  renderUrls();
+}
+
+async function refreshBase() {
+  const b = await api('/api/base');
+  $('baseLabel').textContent = 'Base folder: ' + b.base_dir;
+  $('newDir').placeholder = 'New folder (e.g. Music → ' + b.base_dir + '\\Music)';
+}
+
+$('chooseBase').onclick = async () => {
+  const r = await api('/api/choose-dir', { method: 'POST' });
+  if (!r.ok) { $('baseLabel').textContent = '✗ ' + r.message; return; }
+  refreshBase(); loadDirs(); refreshCookies();
+};
+
+async function loadDirs() {
+  const r = await api('/api/dirs');
+  $('dirSel').innerHTML = '';
+  (r.dirs || []).forEach(d => {
+    const o = document.createElement('option');
+    o.value = d; o.textContent = d;
+    $('dirSel').append(o);
+  });
+  // chips only for manually-added dirs (scanned folders are managed by the filesystem)
+  $('dirList').innerHTML = '';
+  (r.pins || []).forEach(d => {
+    const chip = document.createElement('span'); chip.className = 'chip';
+    const txt = document.createElement('span'); txt.textContent = d;
+    const x = document.createElement('button'); x.className = 'mini'; x.textContent = '✕';
+    x.onclick = async () => {
+      await api('/api/dirs', { method: 'DELETE', body: JSON.stringify({ dir: d }) });
+      loadDirs();
+    };
+    chip.append(txt, x);
+    $('dirList').append(chip);
+  });
+}
+
+async function addDir() {
+  const v = $('newDir').value.trim();
+  if (!v) return;
+  await api('/api/dirs', { method: 'POST', body: JSON.stringify({ dir: v }) });
+  $('newDir').value = '';
+  loadDirs();
+}
+
+async function startDownload() {
+  if (!urls.length) return;
+  await api('/api/download', { method: 'POST', body: JSON.stringify({
+    urls: urls, dir: $('dirSel').value, browser: $('browser').value,
+    use_cookies: $('useCookies').checked }) });
+  poll();
+}
+
+function human(n) {
+  n = Number(n);
+  if (!isFinite(n)) return '?';
+  const u = ['B', 'KiB', 'MiB', 'GiB'];
+  let i = 0;
+  while (n >= 1024 && i < 3) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+}
+
+function jobCard(j) {
+  const d = document.createElement('div'); d.className = 'job';
+  const head = document.createElement('div');
+  const status = j.status === 'running' ? Math.round(j.percent) + '%' : j.status;
+  const hs = document.createElement('b'); hs.textContent = j.index + '/' + j.total + ' · ' + status + ' · ';
+  const dir = document.createElement('span'); dir.className = 'chip'; dir.textContent = j.dir;
+  head.append(hs, dir);
+  d.append(head);
+  const msg = document.createElement('div'); msg.className = 'muted';
+  msg.textContent = j.message || ''; d.append(msg);
+  if (j.status === 'running') {
+    const bar = document.createElement('div'); bar.className = 'bar';
+    const fill = document.createElement('div'); fill.style.width = j.percent + '%';
+    bar.append(fill); d.append(bar);
+    if (j.progress) {
+      const p = j.progress;
+      const speed = Number(p.speed) > 0 ? human(p.speed) + '/s' : '?';
+      let eta = '';
+      if (Number(p.eta) > 0) {
+        const s = Math.round(Number(p.eta));
+        eta = ' · ETA ' + String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+      }
+      const t = document.createElement('div'); t.className = 'muted';
+      t.textContent = `${human(p.down)} / ${human(p.total)} · ${speed}${eta}`;
+      d.append(t);
+    }
+  }
+  if (j.error) {
+    const e = document.createElement('div'); e.className = 'error';
+    e.textContent = j.error; d.append(e);
+  }
+  if (j.files.length) {
+    const f = document.createElement('div'); f.className = 'files';
+    f.textContent = j.files.join('\n'); d.append(f);
+  }
+  return d;
+}
+
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  const r = await api('/api/jobs');
+  $('jobs').innerHTML = '';
+  r.jobs.forEach(j => $('jobs').append(jobCard(j)));
+  if (r.jobs.some(j => j.status === 'running')) {
+    setTimeout(poll, 600);
+  } else {
+    loadHistory();
+    refreshCookies();
+    loadDirs();  // a download may have created a new folder
+  }
+  polling = false;
+}
+
+async function loadHistory() {
+  const h = await api('/api/history');
+  $('history').textContent = h.map(e => e.time + ' · ' + e.files.join(', ')).join('\n') || 'nothing yet';
+}
+
+$('paste').addEventListener('paste', () => setTimeout(extract, 50));
+$('extract').onclick = extract;
+$('clear').onclick = () => { urls = []; $('paste').value = ''; renderUrls(); };
+$('addUrl').onclick = () => {
+  const v = $('newUrl').value.trim();
+  if (v) { urls.push(v); $('newUrl').value = ''; renderUrls(); }
+};
+$('addDir').onclick = addDir;
+$('download').onclick = startDownload;
+
+$('cookieNote').textContent =
+  'How cookies work: the browser selected below must be CLOSED to export its cookies (Chromium locks them '
+  + 'while running). Open this page in any other browser, or run "python app.py --export-cookies <browser>" '
+  + 'in a terminal. Downloads re-export automatically when the browser is closed.';
+
+async function refreshCookies() {
+  const s = await api('/api/cookies/status');
+  $('cookieStatus').textContent = s.exists
+    ? `cookies.txt: ${s.count} cookies (${s.session} session, ${s.expired} expired) · next expiry ${s.next_expiry || 'never'} · ${s.domains.join(', ')}`
+    : 'no cookies.txt - browser cookies are used (browser must be closed)';
+}
+
+$('exportCookies').onclick = async () => {
+  const r = await api('/api/cookies/export', { method: 'POST', body: JSON.stringify({ browser: $('browser').value }) });
+  $('cookieStatus').textContent = (r.ok ? '✓ ' : '✗ ') + r.message;
+  if (r.ok) refreshCookies();
+};
+
+loadDirs(); loadHistory(); refreshCookies(); refreshBase();
+</script>
+</body>
+</html>
