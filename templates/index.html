@@ -65,6 +65,7 @@
   <div id="dirList"></div>
   <div class="row">
     <select id="browser">
+      <option value="playwright">playwright (app window)</option>
       <option value="opera">opera</option>
       <option value="edge">edge</option>
       <option value="chrome">chrome</option>
@@ -253,9 +254,9 @@ $('addDir').onclick = addDir;
 $('download').onclick = startDownload;
 
 $('cookieNote').textContent =
-  'How cookies work: the browser selected below must be CLOSED to export its cookies (Chromium locks them '
-  + 'while running). Open this page in any other browser, or run "python app.py --export-cookies <browser>" '
-  + 'in a terminal. Downloads re-export automatically when the browser is closed.';
+  'How cookies work: real browsers (opera/edge/chrome) must be CLOSED to export their cookies (Chromium '
+  + 'locks the DB while running). "playwright (app window)" is the app\'s own browser - log in there and '
+  + 'cookies export live, no need to close it. Downloads re-export automatically when cookies are stale.';
 
 async function refreshCookies() {
   const s = await api('/api/cookies/status');

@@ -19,6 +19,8 @@ DEFAULT_DIRS = [BASE_DIR]
 URL_RE = re.compile(r"https?://[^\s<>\"'，。；、\)\]]+")
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+UI_CONTEXT = None  # live Playwright browser context of the UI window (set by _open_ui_browser)
+UI_LOCK = threading.Lock()  # serialize Playwright calls across threads
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # our --progress-template lines: "4751360 10485760 2424832.0 5 45.2%"
 # (unknown numeric fields render as "NA"; percent empty when total is unknown)
@@ -42,6 +44,11 @@ def load_config():
 
 def cookies_path():
     return Path(load_config()["base_dir"]) / "cookies.txt"
+
+
+def ui_profile_dir():
+    """Persistent profile for the app's own Playwright browser (cookies survive restarts)."""
+    return str(Path(load_config()["base_dir"]) / ".ui-profile")
 
 
 def save_config(cfg):
@@ -134,9 +141,42 @@ def _cookie_line(c):
                       (c.value or "").replace("\t", " ").replace("\n", " ")])
 
 
+def _playwright_cookie_line(c):
+    """Playwright cookie dict -> one Netscape line (expires is already Unix seconds)."""
+    dom = c["domain"]
+    return "\t".join([dom, "TRUE" if dom.startswith(".") else "FALSE",
+                      c.get("path") or "/", "TRUE" if c.get("secure") else "FALSE",
+                      str(int(c.get("expires") or 0)),
+                      (c["name"] or "").replace("\t", " ").replace("\n", " "),
+                      (c["value"] or "").replace("\t", " ").replace("\n", " ")])
+
+
+def export_playwright_cookies():
+    """Pull cookies from the app's live UI browser via the Playwright API - no DB lock,
+    and immune to Edge/Chrome v20 app-bound encryption. Requires the window to be open."""
+    with UI_LOCK:
+        global UI_CONTEXT
+        ctx = UI_CONTEXT
+        if ctx is not None:
+            try:
+                cookies = ctx.cookies()
+            except Exception:
+                UI_CONTEXT = None  # window was closed; nothing to export without it
+                ctx = None
+    if ctx is None:
+        raise CookieStaleError(
+            "the app window is closed - restart the app to reopen it (your douyin "
+            "session is saved in its profile), then retry")
+    lines = ["# Netscape HTTP Cookie File"] + [_playwright_cookie_line(c) for c in cookies]
+    cookies_path().write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(lines) - 1
+
+
 def export_cookies(browser):
     """Reuse yt-dlp's own browser-cookie decryption (incl. Chromium app-bound keys),
     dump the result to D:/Transport/cookies.txt. Fails while the browser is open."""
+    if browser == "playwright":
+        return export_playwright_cookies()
     from yt_dlp.cookies import extract_cookies_from_browser
 
     cj = extract_cookies_from_browser(browser)
@@ -154,6 +194,44 @@ def _short_err(e):
     return s[0][:160] if s else type(e).__name__
 
 
+def _cookie_hint(e, browser):
+    """Actionable fix for a cookie export failure, by failure class."""
+    if "DPAPI" in str(e):
+        return ("Edge/Chrome app-bound encryption (v20) blocks cookie-DB decryption. "
+                "Use 'playwright (app window)' instead: open www.douyin.com in the app "
+                "window, then download - cookies are read live, no decryption needed.")
+    if browser == "playwright":
+        return "Restart the app to reopen its window, log in there, then retry."
+    return "Close the browser and click 'Export cookies', or untick 'use cookies'."
+
+
+def _enrich_error(err, use_cookies):
+    """Append actionable advice for known yt-dlp failure classes.
+    'cookies are needed' (site demands a session) is NOT a cookie-access failure."""
+    low = err.lower()
+    if "could not find" in low:
+        return err + ("\n\nNo cookie database found for this browser on this PC. "
+                      "Pick another browser in the dropdown, or close it and click 'Export cookies'.")
+    if "fresh cookies" in low:
+        return err + ("\n\nDouyin needs fresh session cookies, not a login: in the app window, "
+                      "open www.douyin.com and complete any verification (slide captcha) if it "
+                      "appears, then retry. " + ("tick 'use cookies' first." if not use_cookies else ""))
+    if any(k in low for k in ("cookies are needed", "cookies are required", "requires login",
+                              "login required", "not logged in", "logged in", "logged-in")):
+        return err + ("\n\nThis site needs cookies: " + (
+            "tick 'use cookies' and pick a logged-in browser (close it once so its cookies "
+            "can be exported, then it can stay open)."
+            if not use_cookies else
+            "your saved cookies aren't accepted - re-export from a logged-in browser "
+            "(close it, then click 'Export cookies')."))
+    if "cookie" in low:
+        return err + ("\n\nCookie access failed - this browser's cookies are locked while it is open "
+                      "(the 'Chrome cookie database' message is yt-dlp's generic name for Chromium, "
+                      "Opera/Edge/Chrome alike). Close the browser and retry - cookies are exported "
+                      "automatically and reused for later downloads.")
+    return err
+
+
 def _resolve_cookies(job):
     """Use cookies.txt if fresh; auto re-export when stale/missing and browser is closed."""
     status = cookies_status()
@@ -161,12 +239,15 @@ def _resolve_cookies(job):
         return ["--cookies", str(cookies_path())], "cookies.txt"
     try:
         n = export_cookies(job["browser"])
-        return ["--cookies", str(cookies_path())], f"cookies.txt (auto-exported {n})"
+        src = f"cookies.txt (auto-exported {n})"
+        if job["browser"] == "playwright" and n == 0:
+            src += " - no login: log in via the app window first"
+        return ["--cookies", str(cookies_path())], src
     except Exception as e:
-        if status["exists"]:
+        if status["exists"] or job["browser"] == "playwright":
             raise CookieStaleError(
                 f"Saved cookies are expired and auto re-export failed ({_short_err(e)}). "
-                "Close the browser and click 'Export cookies', or untick 'use cookies'.")
+                f"{_cookie_hint(e, job['browser'])}")
         return ["--cookies-from-browser", job["browser"]], job["browser"]
 
 
@@ -218,15 +299,7 @@ def _run_job(job):
             proc.wait()
             if proc.returncode != 0:
                 err = "\n".join(dict.fromkeys(job["lines"][-12:]))  # dedupe yt-dlp's retry repeats
-                if "could not find" in err.lower():
-                    err += ("\n\nNo cookie database found for this browser on this PC. "
-                            "Pick another browser in the dropdown, or close it and click 'Export cookies'.")
-                elif "cookie" in err.lower():
-                    err += ("\n\nCookie access failed - this browser's cookies are locked while it is open "
-                            "(the 'Chrome cookie database' message is yt-dlp's generic name for Chromium, "
-                            "Opera/Edge/Chrome alike). Close the browser and retry - cookies are exported "
-                            "automatically and reused for later downloads.")
-                job["status"], job["error"] = "error", err
+                job["status"], job["error"] = "error", _enrich_error(err, job["use_cookies"])
                 return
         job["status"] = "done"
     except Exception as e:
@@ -399,8 +472,7 @@ def api_cookies_export():
         return jsonify({"ok": True, "message": f"Exported {n} cookies from {browser}"})
     except Exception as e:
         return jsonify({"ok": False,
-                        "message": f"{_short_err(e)} — close the browser and try again, "
-                                   "or run: python app.py --export-cookies {browser}"}), 400
+                        "message": f"{_short_err(e)} — {_cookie_hint(e, browser)}"}), 400
 
 
 def _selftest():
@@ -419,14 +491,27 @@ def _selftest():
     assert _normalize_expiry(13448366773549492) == 1803893173  # WebTime -> Unix
     assert _normalize_expiry(1800000000) == 1800000000          # already seconds
     assert _normalize_expiry(0) == 0 and _normalize_expiry(-5) == 0
+    pw = {"name": "sid", "value": "abc", "domain": ".douyin.com", "path": "/",
+          "expires": -1, "secure": False, "httpOnly": True}
+    assert _playwright_cookie_line(pw) == ".douyin.com\tTRUE\t/\tFALSE\t-1\tsid\tabc"
+    site_err = _enrich_error("ERROR: [Douyin] x: Fresh cookies (not necessarily logged in) are needed", False)
+    assert "tick 'use cookies'" in site_err and "locked while it is open" not in site_err, site_err
+    locked = _enrich_error("ERROR: Chrome cookie database is locked", True)
+    assert "locked while it is open" in locked and "tick 'use cookies'" not in locked, locked
+    assert _enrich_error("ERROR: something unrelated", True) == "ERROR: something unrelated"
+    dpapi = _cookie_hint(Exception("Failed to decrypt with DPAPI. See .../10927"), "edge")
+    assert "app-bound" in dpapi and "playwright" in dpapi, dpapi
+    assert "Close the browser" in _cookie_hint(Exception("x"), "edge")
+    assert "Restart the app" in _cookie_hint(Exception("x"), "playwright")
     print("selftest ok")
 
 
 def _open_ui_browser(url="http://127.0.0.1:5000"):
-    """Open the UI in a dedicated Playwright browser, isolated from your real browsers
-    (so its profile never locks the cookies you export). The browser is a child of
-    Playwright's driver, which exits with this process - it dies when app.py dies.
-    Falls back to the system browser if Playwright/browsers are unavailable."""
+    """Open the UI in a dedicated Playwright browser, isolated from your real browsers.
+    A persistent profile (base_dir/.ui-profile) keeps logins across restarts; its cookies
+    can be exported while it's open, since Playwright reads them via its API, not the DB.
+    The browser is a child of Playwright's driver, which exits with this process - it dies
+    when app.py dies. Falls back to the system browser if Playwright/browsers are unavailable."""
 
     def run():
         try:
@@ -438,16 +523,25 @@ def _open_ui_browser(url="http://127.0.0.1:5000"):
         try:
             with sync_playwright() as p:
                 try:
-                    browser = p.chromium.launch(channel="msedge")  # reuse installed Edge, no download
+                    ctx = p.chromium.launch_persistent_context(
+                        ui_profile_dir(), channel="msedge",
+                        ignore_default_args=["--enable-automation"],
+                        args=["--disable-blink-features=AutomationControlled"])  # look less automated to site risk control
                 except Exception:
-                    browser = p.chromium.launch()  # bundled chromium (needs: uv run playwright install chromium)
-                page = browser.new_page(viewport={"width": 700, "height": 960})
-                for _ in range(30):  # the Flask server may still be starting
-                    try:
-                        page.goto(url, timeout=3000)
-                        break
-                    except Exception:
-                        time.sleep(1)
+                    ctx = p.chromium.launch_persistent_context(
+                        ui_profile_dir(),
+                        ignore_default_args=["--enable-automation"],
+                        args=["--disable-blink-features=AutomationControlled"])  # bundled chromium fallback
+                global UI_CONTEXT
+                UI_CONTEXT = ctx
+                page = ctx.new_page(viewport={"width": 700, "height": 960})
+                with UI_LOCK:  # serialize with cookie export while the server is still starting
+                    for _ in range(30):  # the Flask server may still be starting
+                        try:
+                            page.goto(url, timeout=3000)
+                            break
+                        except Exception:
+                            time.sleep(1)
                 while True:
                     time.sleep(60)  # keep the browser referenced until the process exits
         except Exception as e:
@@ -467,6 +561,7 @@ if __name__ == "__main__":
             print(f"Exported {n} cookies from {browser} to {cookies_path()}")
         except Exception as e:
             print(f"Export failed: {_short_err(e)}")
+            print(_cookie_hint(e, browser))
             sys.exit(1)
         sys.exit(0)
     _open_ui_browser()
