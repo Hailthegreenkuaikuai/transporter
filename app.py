@@ -21,6 +21,11 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 UI_CONTEXT = None  # live Playwright browser context of the UI window (set by _open_ui_browser)
 UI_LOCK = threading.Lock()  # serialize Playwright calls across threads
+# Playwright's sync API is thread-bound: every call must run on the thread that
+# created the context. Requests from Flask threads are queued here and serviced by
+# the _open_ui_browser loop on the browser's own thread.
+UI_CMD_COND = threading.Condition()
+_ui_export_reqs = []  # list of {"ready": Event, "result": cookies | Exception}
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # our --progress-template lines: "4751360 10485760 2424832.0 5 45.2%"
 # (unknown numeric fields render as "NA"; percent empty when total is unknown)
@@ -153,20 +158,29 @@ def _playwright_cookie_line(c):
 
 def export_playwright_cookies():
     """Pull cookies from the app's live UI browser via the Playwright API - no DB lock,
-    and immune to Edge/Chrome v20 app-bound encryption. Requires the window to be open."""
+    and immune to Edge/Chrome v20 app-bound encryption. Requires the window to be open.
+    Playwright's sync API is thread-bound, so the read is queued to the browser's own
+    thread (see UI_CMD_COND) rather than called from this Flask thread."""
     with UI_LOCK:
         global UI_CONTEXT
-        ctx = UI_CONTEXT
-        if ctx is not None:
-            try:
-                cookies = ctx.cookies()
-            except Exception:
-                UI_CONTEXT = None  # window was closed; nothing to export without it
-                ctx = None
-    if ctx is None:
+        if UI_CONTEXT is None:
+            raise CookieStaleError(
+                "the app window is closed - restart the app to reopen it (your douyin "
+                "session is saved in its profile), then retry")
+        req = {"ready": threading.Event(), "result": None}
+        with UI_CMD_COND:
+            _ui_export_reqs.append(req)
+            UI_CMD_COND.notify()
+        if not req["ready"].wait(timeout=15):
+            UI_CONTEXT = None  # the browser thread is gone; don't keep probing a dead context
+            raise CookieStaleError("the app window is not responding - restart the app and retry")
+        res = req["result"]
+    if isinstance(res, Exception):
+        UI_CONTEXT = None  # window closed while we were waiting
         raise CookieStaleError(
             "the app window is closed - restart the app to reopen it (your douyin "
             "session is saved in its profile), then retry")
+    cookies = res
     lines = ["# Netscape HTTP Cookie File"] + [_playwright_cookie_line(c) for c in cookies]
     cookies_path().write_text("\n".join(lines) + "\n", encoding="utf-8")
     return len(lines) - 1
@@ -201,7 +215,9 @@ def _cookie_hint(e, browser):
                 "Use 'playwright (app window)' instead: open www.douyin.com in the app "
                 "window, then download - cookies are read live, no decryption needed.")
     if browser == "playwright":
-        return "Restart the app to reopen its window, log in there, then retry."
+        return ("Restart the app to reopen its window, open a douyin video page there "
+                "(no login needed; ttwid + passport_csrf_token are set on video pages), "
+                "then click 'Export cookies' and retry.")
     return "Close the browser and click 'Export cookies', or untick 'use cookies'."
 
 
@@ -213,9 +229,11 @@ def _enrich_error(err, use_cookies):
         return err + ("\n\nNo cookie database found for this browser on this PC. "
                       "Pick another browser in the dropdown, or close it and click 'Export cookies'.")
     if "fresh cookies" in low:
-        return err + ("\n\nDouyin needs fresh session cookies, not a login: in the app window, "
-                      "open www.douyin.com and complete any verification (slide captcha) if it "
-                      "appears, then retry. " + ("tick 'use cookies' first." if not use_cookies else ""))
+        return err + ("\n\nDouyin needs fresh cookies, not a login: in the app window open an "
+                      "actual douyin VIDEO page (ttwid + passport_csrf_token are only set there, "
+                      "not on the homepage), wait for it to load, then click 'Export cookies' "
+                      "(or delete cookies.txt) to write them, and retry. "
+                      + ("tick 'use cookies' first." if not use_cookies else ""))
     if any(k in low for k in ("cookies are needed", "cookies are required", "requires login",
                               "login required", "not logged in", "logged in", "logged-in")):
         return err + ("\n\nThis site needs cookies: " + (
@@ -241,7 +259,7 @@ def _resolve_cookies(job):
         n = export_cookies(job["browser"])
         src = f"cookies.txt (auto-exported {n})"
         if job["browser"] == "playwright" and n == 0:
-            src += " - no login: log in via the app window first"
+            src += " - 0 cookies: open www.douyin.com in the app window first (no login needed)"
         return ["--cookies", str(cookies_path())], src
     except Exception as e:
         if status["exists"] or job["browser"] == "playwright":
@@ -525,16 +543,18 @@ def _open_ui_browser(url="http://127.0.0.1:5000"):
                 try:
                     ctx = p.chromium.launch_persistent_context(
                         ui_profile_dir(), channel="msedge",
+                        viewport={"width": 700, "height": 960},
                         ignore_default_args=["--enable-automation"],
                         args=["--disable-blink-features=AutomationControlled"])  # look less automated to site risk control
                 except Exception:
                     ctx = p.chromium.launch_persistent_context(
                         ui_profile_dir(),
+                        viewport={"width": 700, "height": 960},
                         ignore_default_args=["--enable-automation"],
                         args=["--disable-blink-features=AutomationControlled"])  # bundled chromium fallback
                 global UI_CONTEXT
                 UI_CONTEXT = ctx
-                page = ctx.new_page(viewport={"width": 700, "height": 960})
+                page = ctx.new_page()
                 with UI_LOCK:  # serialize with cookie export while the server is still starting
                     for _ in range(30):  # the Flask server may still be starting
                         try:
@@ -543,11 +563,39 @@ def _open_ui_browser(url="http://127.0.0.1:5000"):
                         except Exception:
                             time.sleep(1)
                 while True:
-                    time.sleep(60)  # keep the browser referenced until the process exits
+                    # service cookie exports on THIS thread (sync API is thread-bound)
+                    with UI_CMD_COND:
+                        while not _ui_export_reqs:
+                            UI_CMD_COND.wait(60)  # keep the browser referenced until the process exits
+                        reqs = _ui_export_reqs[:]
+                        _ui_export_reqs.clear()
+                    for req in reqs:
+                        try:
+                            req["result"] = ctx.cookies()
+                        except Exception as e:
+                            req["result"] = e
+                        finally:
+                            req["ready"].set()
         except Exception as e:
             print(f"[transporter] could not open UI browser ({e}) - open {url} in any browser instead")
 
     threading.Thread(target=run, daemon=True).start()
+
+
+def _already_running():
+    """True if another instance already serves 127.0.0.1:5000.
+
+    Two instances each launch their own Playwright window on the same .ui-profile,
+    so cookie export ends up reading the wrong window. Refuse to start instead."""
+    import socket
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 5000))  # fails if the port is taken
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
 
 
 if __name__ == "__main__":
@@ -564,5 +612,9 @@ if __name__ == "__main__":
             print(_cookie_hint(e, browser))
             sys.exit(1)
         sys.exit(0)
+    if _already_running():
+        print("[transporter] another instance is already running at http://127.0.0.1:5000 - "
+              "close it first, then start one app only")
+        sys.exit(1)
     _open_ui_browser()
     app.run(host="127.0.0.1", port=5000)

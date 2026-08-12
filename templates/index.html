@@ -255,8 +255,9 @@ $('download').onclick = startDownload;
 
 $('cookieNote').textContent =
   'How cookies work: real browsers (opera/edge/chrome) must be CLOSED to export their cookies (Chromium '
-  + 'locks the DB while running). "playwright (app window)" is the app\'s own browser - log in there and '
-  + 'cookies export live, no need to close it. Downloads re-export automatically when cookies are stale.';
+  + 'locks the DB while running). "playwright (app window)" is the app\'s own browser - open a douyin VIDEO '
+  + 'page in it (no login needed; ttwid + passport_csrf_token are only set on video pages, not the homepage) '
+  + 'and cookies export live. Stale cookies.txt is NOT auto-refreshed: revisit a video page, then click "Export cookies".';
 
 async function refreshCookies() {
   const s = await api('/api/cookies/status');
