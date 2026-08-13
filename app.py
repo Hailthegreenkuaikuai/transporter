@@ -75,12 +75,16 @@ def ytdlp_cmd(url, out_dir, cookie_args):
     exe = shutil.which("yt-dlp")
     cmd = [exe] if exe else [sys.executable, "-m", "yt_dlp"]
     cmd += cookie_args
-    return cmd + ["--newline", "--progress", "--no-warnings", "--no-playlist",
-                  "--print", "after_move:filepath",
-                  "--progress-template", ("download:%(progress.downloaded_bytes)s "
-                                           "%(progress.total_bytes)s %(progress.speed)s "
-                                           "%(progress.eta)s %(progress._percent_str)s"),
-                  "-o", os.path.join(out_dir, "%(title)s.%(ext)s"), url]
+    cmd += ["--newline", "--progress", "--no-warnings", "--no-playlist",
+            "--print", "after_move:filepath",
+            "--progress-template", ("download:%(progress.downloaded_bytes)s "
+                                     "%(progress.total_bytes)s %(progress.speed)s "
+                                     "%(progress.eta)s %(progress._percent_str)s"),
+            "-o", os.path.join(out_dir, "%(title)s.%(ext)s")]
+    if "douyin" in url.lower():
+        # also capture the creator's 抖音號 (author unique_id); parsed as a DYID: line
+        cmd += ["--print", "DYID:%(uploader)s"]
+    return cmd + [url]
 
 
 WEBTIME_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
@@ -275,8 +279,8 @@ def start_job(urls, out_dir, browser, use_cookies):
             "id": f"{time.time_ns()}",
             "urls": urls, "dir": out_dir, "browser": browser, "use_cookies": use_cookies,
             "status": "running", "percent": 0, "index": 0, "total": len(urls),
-            "message": "starting...", "files": [], "error": None, "progress": None,
-            "cookie_source": "..." if use_cookies else "none",
+            "message": "starting...", "files": [], "file_dyids": [], "error": None, "progress": None,
+            "dyid": None, "cookie_source": "..." if use_cookies else "none",
         }
         JOBS[job["id"]] = job
     threading.Thread(target=_run_job, args=(job,), daemon=True).start()
@@ -289,7 +293,7 @@ def _run_job(job):
         os.makedirs(job["dir"], exist_ok=True)
         cookie_args, job["cookie_source"] = _resolve_cookies(job) if job["use_cookies"] else ([], "none")
         for i, url in enumerate(job["urls"], 1):
-            job["index"], job["percent"], job["message"], job["progress"] = i, 0, f"downloading {i}/{job['total']}", None
+            job["index"], job["percent"], job["message"], job["progress"], job["dyid"] = i, 0, f"downloading {i}/{job['total']}", None, None
             # streams are merged: yt-dlp routes progress/logs/paths to different streams
             # depending on binary and flags, so one loop classifies every line
             proc = subprocess.Popen(
@@ -308,12 +312,15 @@ def _run_job(job):
                         job["percent"] = float(pct[:-1])
                     job["progress"] = {"pct": job["percent"], "down": m.group(1), "total": m.group(2),
                                        "speed": m.group(3), "eta": m.group(4)}
+                elif line.startswith("DYID:"):
+                    job["dyid"] = None if line == "DYID:NA" else line[5:]  # 抖音號 (author unique_id)
                 elif line.startswith(("WARNING:", "ERROR:", "[")):
                     job["lines"].append(line)
                     job["lines"] = job["lines"][-200:]
                     job["message"] = line[-120:]
                 else:  # --print after_move:filepath output (absolute paths never start with "[")
                     job["files"].append(line)
+                    job["file_dyids"].append(job["dyid"])
             proc.wait()
             if proc.returncode != 0:
                 err = "\n".join(dict.fromkeys(job["lines"][-12:]))  # dedupe yt-dlp's retry repeats
@@ -327,14 +334,16 @@ def _run_job(job):
 
 
 def _record_dir_history(job):
-    """Append {time, filename, url} to <dir>/.transporter.json for each downloaded file."""
+    """Append {time, filename, url, dyid} to <dir>/.transporter.json for each downloaded file."""
     if not job.get("files"):
         return
     with open(os.path.join(job["dir"], ".transporter.json"), "a", encoding="utf-8") as f:
-        for file, url in zip(job["files"], job["urls"]):
-            f.write(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M"),
-                                "file": os.path.basename(file), "url": url},
-                               ensure_ascii=False) + "\n")
+        for file, url, dyid in zip(job["files"], job["urls"], job.get("file_dyids") or []):
+            rec = {"time": time.strftime("%Y-%m-%d %H:%M"),
+                   "file": os.path.basename(file), "url": url}
+            if dyid:
+                rec["dyid"] = dyid  # 抖音號 of the video's creator (douyin links only)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def _record_history(job):
@@ -343,7 +352,8 @@ def _record_history(job):
     _record_dir_history(job)
     cfg = load_config()
     cfg["history"] = [{"time": time.strftime("%Y-%m-%d %H:%M"),
-                       "dir": job["dir"], "files": job["files"]}] + cfg["history"]
+                       "dir": job["dir"], "files": job["files"],
+                       "dyids": [d for d in job.get("file_dyids") or [] if d]}] + cfg["history"]
     cfg["history"] = cfg["history"][:100]
     save_config(cfg)
 
@@ -430,7 +440,7 @@ def api_download():
 
 def _job_view(job):
     return {k: job.get(k) for k in ("id", "status", "index", "total", "percent",
-                                    "message", "files", "error", "dir", "cookie_source", "progress")}
+                                    "message", "files", "error", "dir", "cookie_source", "progress", "dyid")}
 
 
 @app.get("/api/jobs")
@@ -499,6 +509,9 @@ def _selftest():
     assert extract_urls(sample) == ["https://v.douyin.com/Oa6WLk8qJuc/"], extract_urls(sample)
     assert extract_urls("no urls here") == []
     assert extract_urls("a https://x.com/1 b https://x.com/1 c") == ["https://x.com/1"]
+    dy = ytdlp_cmd("https://v.douyin.com/QKv-Jhc3Me0/", "D:/o", [])
+    assert "DYID:%(uploader)s" in dy, dy  # douyin links also capture the creator's 抖音號
+    assert not any("DYID" in c for c in ytdlp_cmd("https://x.com/1", "D:/o", [])), dy
     assert resolve_dir("Music") == os.path.join("D:/Transport", "Music")
     assert resolve_dir("D:/Videos/x") == "D:/Videos/x"
     from http.cookiejar import Cookie

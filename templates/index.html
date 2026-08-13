@@ -193,6 +193,10 @@ function jobCard(j) {
   d.append(head);
   const msg = document.createElement('div'); msg.className = 'muted';
   msg.textContent = j.message || ''; d.append(msg);
+  if (j.dyid) {
+    const dy = document.createElement('div'); dy.className = 'muted';
+    dy.textContent = '抖音號 ' + j.dyid; d.append(dy);
+  }
   if (j.status === 'running') {
     const bar = document.createElement('div'); bar.className = 'bar';
     const fill = document.createElement('div'); fill.style.width = j.percent + '%';
@@ -240,7 +244,8 @@ async function poll() {
 
 async function loadHistory() {
   const h = await api('/api/history');
-  $('history').textContent = h.map(e => e.time + ' · ' + e.files.join(', ')).join('\n') || 'nothing yet';
+  $('history').textContent = h.map(e => e.time + ' · ' + e.files.join(', ')
+    + ((e.dyids && e.dyids.length) ? ' · 抖音號 ' + e.dyids.join(', ') : '')).join('\n') || 'nothing yet';
 }
 
 $('paste').addEventListener('paste', () => setTimeout(extract, 50));
