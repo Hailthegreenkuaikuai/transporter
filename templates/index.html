@@ -27,6 +27,10 @@
   .job { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px; }
   .error { color:#dc2626; font-size:13px; white-space:pre-wrap; }
   .files { font-size:12px; color:var(--muted); word-break:break-all; white-space:pre-wrap; }
+  table.hist { width:100%; border-collapse:collapse; }
+  table.hist th, table.hist td { border:1px solid var(--line); padding:4px 6px;
+                                 text-align:left; vertical-align:top; word-break:break-all; }
+  table.hist th { background:var(--bg); }
   .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line);
           border-radius:999px; padding:3px 10px; font-size:12px; margin:0 6px 6px 0; background:var(--bg); }
   footer { color:var(--muted); font-size:12px; margin-top:16px; }
@@ -86,7 +90,11 @@
 </div>
 
 <div class="card">
-  <div class="lbl">Recent downloads</div>
+  <div class="lbl">History</div>
+  <div class="row">
+    <select id="histDir"></select>
+    <input type="date" id="histDate">
+  </div>
   <div id="history" class="files"></div>
 </div>
 
@@ -156,6 +164,20 @@ async function loadDirs() {
     chip.append(txt, x);
     $('dirList').append(chip);
   });
+  fillHistDir(r.dirs);
+  loadHistory();  // history needs the dir list; dirs may also have changed (e.g. new folder)
+}
+
+function fillHistDir(dirs) {
+  const prev = $('histDir').value;
+  $('histDir').innerHTML = '';
+  (dirs || []).forEach(d => {
+    const o = document.createElement('option');
+    o.value = d; o.textContent = d;
+    $('histDir').append(o);
+  });
+  if (prev && (dirs || []).includes(prev)) $('histDir').value = prev;
+  else if ($('histDir').options.length) $('histDir').value = $('histDir').options[0].value;
 }
 
 async function addDir() {
@@ -243,9 +265,34 @@ async function poll() {
 }
 
 async function loadHistory() {
-  const h = await api('/api/history');
-  $('history').textContent = h.map(e => e.time + ' · ' + e.files.join(', ')
-    + ((e.dyids && e.dyids.length) ? ' · 抖音號 ' + e.dyids.join(', ') : '')).join('\n') || 'nothing yet';
+  const dir = $('histDir').value;
+  if (!dir) { $('history').textContent = 'select a folder'; return; }
+  const q = 'dir=' + encodeURIComponent(dir) + '&date=' + encodeURIComponent($('histDate').value);
+  const h = await api('/api/history?' + q);
+  const box = $('history');
+  box.innerHTML = '';
+  if (!h.length) { box.textContent = 'no downloads for this folder & date'; return; }
+  const table = document.createElement('table');
+  table.className = 'hist';
+  const head = document.createElement('tr');
+  ['Date & time', 'Filename', 'URL', '抖音號'].forEach(c => {
+    const th = document.createElement('th'); th.textContent = c; head.append(th);
+  });
+  table.append(head);
+  h.forEach(r => {
+    const tr = document.createElement('tr');
+    [r.time, r.file, r.url, r.dyid || '—'].forEach(v => {
+      const td = document.createElement('td'); td.textContent = v || ''; tr.append(td);
+    });
+    table.append(tr);
+  });
+  box.append(table);
+}
+
+function initHistDate() {
+  const now = new Date();
+  $('histDate').value = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0')
+    + '-' + String(now.getDate()).padStart(2, '0');
 }
 
 $('paste').addEventListener('paste', () => setTimeout(extract, 50));
@@ -257,6 +304,8 @@ $('addUrl').onclick = () => {
 };
 $('addDir').onclick = addDir;
 $('download').onclick = startDownload;
+$('histDir').onchange = loadHistory;
+$('histDate').onchange = loadHistory;
 
 $('cookieNote').textContent =
   'How cookies work: real browsers (opera/edge/chrome) must be CLOSED to export their cookies (Chromium '
@@ -277,7 +326,7 @@ $('exportCookies').onclick = async () => {
   if (r.ok) refreshCookies();
 };
 
-loadDirs(); loadHistory(); refreshCookies(); refreshBase();
+initHistDate(); loadDirs(); refreshCookies(); refreshBase();
 </script>
 </body>
 </html>

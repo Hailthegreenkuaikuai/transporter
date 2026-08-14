@@ -377,10 +377,13 @@ def api_extract():
 
 
 def _scan_dirs(base):
-    """Top-level subfolders of the base dir, so the dropdown mirrors the filesystem."""
+    """Top-level subfolders of the base dir, so the dropdown mirrors the filesystem.
+    Dot-dirs (.ui-profile = the app's own browser profile) are not download folders."""
     out = []
     try:
         for name in sorted(os.listdir(base)):
+            if name.startswith("."):
+                continue
             p = os.path.join(base, name)
             if os.path.isdir(p):
                 out.append(p)
@@ -459,7 +462,22 @@ def api_jobs():
 
 @app.get("/api/history")
 def api_history():
-    return jsonify(load_config()["history"][:20])
+    """Per-folder download log (<dir>/.transporter.json), newest first.
+    Optional ?date=YYYY-MM-DD filters to records whose download time matches."""
+    d = request.args.get("dir")
+    date = request.args.get("date")
+    recs = []
+    if d:
+        p = Path(d) / ".transporter.json"
+        if p.exists():
+            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not date or rec.get("time", "").startswith(date):
+                    recs.append(rec)
+    return jsonify(list(reversed(recs)))
 
 
 @app.get("/api/base")
@@ -534,6 +552,10 @@ def _selftest():
     locked = _enrich_error("ERROR: Chrome cookie database is locked", True)
     assert "locked while it is open" in locked and "tick 'use cookies'" not in locked, locked
     assert _enrich_error("ERROR: something unrelated", True) == "ERROR: something unrelated"
+    import tempfile
+    _t = tempfile.mkdtemp()
+    os.mkdir(os.path.join(_t, ".ui-profile")); os.mkdir(os.path.join(_t, "Music"))
+    assert _scan_dirs(_t) == [os.path.join(_t, "Music")], _scan_dirs(_t)  # dot-dirs excluded
     dpapi = _cookie_hint(Exception("Failed to decrypt with DPAPI. See .../10927"), "edge")
     assert "app-bound" in dpapi and "playwright" in dpapi, dpapi
     assert "Close the browser" in _cookie_hint(Exception("x"), "edge")
