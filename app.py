@@ -296,10 +296,14 @@ def _run_job(job):
             job["index"], job["percent"], job["message"], job["progress"], job["dyid"] = i, 0, f"downloading {i}/{job['total']}", None, None
             # streams are merged: yt-dlp routes progress/logs/paths to different streams
             # depending on binary and flags, so one loop classifies every line
+            # yt-dlp prints file paths (titles) in the locale encoding on Windows
+            # (here cp950), which we read as UTF-8 -> mojibake in history/recent
+            # downloads. Force the child to emit UTF-8.
             proc = subprocess.Popen(
                 ytdlp_cmd(url, job["dir"], cookie_args),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             )
             for line in proc.stdout:
                 line = line.strip()
