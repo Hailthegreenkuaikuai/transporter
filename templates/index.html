@@ -79,6 +79,7 @@
   </div>
   <div class="row">
     <span class="muted" id="cookieStatus">checking cookies…</span>
+    <button id="extractToken" class="primary">Extract token</button>
     <button id="exportCookies">Export cookies</button>
   </div>
   <p class="muted" id="cookieNote"></p>
@@ -309,9 +310,10 @@ $('histDate').onchange = loadHistory;
 
 $('cookieNote').textContent =
   'How cookies work: real browsers (opera/edge/chrome) must be CLOSED to export their cookies (Chromium '
-  + 'locks the DB while running). "playwright (app window)" is the app\'s own browser - open a douyin VIDEO '
-  + 'page in it (no login needed; ttwid + passport_csrf_token are only set on video pages, not the homepage) '
-  + 'and cookies export live. Stale cookies.txt is NOT auto-refreshed: revisit a video page, then click "Export cookies".';
+  + 'locks the DB while running). "Extract token" automates the douyin ritual in a separate browser window '
+  + '(opens a video, closes login popups, lets it play) then exports - no login needed; ttwid + '
+  + 'passport_csrf_token are only set on video pages. "Export cookies" reads them as-is. If auto-extraction '
+  + 'fails, it prints the manual steps to follow instead.';
 
 async function refreshCookies() {
   const s = await api('/api/cookies/status');
@@ -319,6 +321,13 @@ async function refreshCookies() {
     ? `cookies.txt: ${s.count} cookies (${s.session} session, ${s.expired} expired) · next expiry ${s.next_expiry || 'never'} · ${s.domains.join(', ')}`
     : 'no cookies.txt - browser cookies are used (browser must be closed)';
 }
+
+$('extractToken').onclick = async () => {
+  $('cookieStatus').textContent = 'running douyin token extraction… (a douyin window will open)';
+  const r = await api('/api/cookies/extract-token', { method: 'POST' });
+  $('cookieStatus').textContent = (r.ok ? '✓ ' : '✗ ') + r.message;
+  if (r.ok) refreshCookies();
+};
 
 $('exportCookies').onclick = async () => {
   const r = await api('/api/cookies/export', { method: 'POST', body: JSON.stringify({ browser: $('browser').value }) });

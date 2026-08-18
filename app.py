@@ -31,6 +31,19 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # (unknown numeric fields render as "NA"; percent empty when total is unknown)
 TPL_RE = re.compile(r"^(\d+)\s+([\d.]+|NA)\s+([\d.]+|NA)\s+([\d.]+|NA)\s?(.*)$")
 
+DOUYIN_URL = "https://www.douyin.com/"
+TOKEN_COOKIES = ("ttwid", "passport_csrf_token")
+# best-effort close buttons for douyin's login modal/popup; all optional - a miss just
+# means the next step fails and we fall back to the manual ritual (cookie check is the real gate)
+LOGIN_CLOSE_SEL = (
+    "#login-modal .dy-close",
+    "#login-modal [aria-label='关闭']",
+    "#login-modal .close",
+    "[data-e2e='login-close']",
+    ".secs-layer-close",
+)
+VIDEO_SEL = ("a[href*='/video/']", "[data-e2e='feed-video']")
+
 
 class CookieStaleError(Exception):
     pass
@@ -160,34 +173,258 @@ def _playwright_cookie_line(c):
                       (c["value"] or "").replace("\t", " ").replace("\n", " ")])
 
 
-def export_playwright_cookies():
-    """Pull cookies from the app's live UI browser via the Playwright API - no DB lock,
-    and immune to Edge/Chrome v20 app-bound encryption. Requires the window to be open.
-    Playwright's sync API is thread-bound, so the read is queued to the browser's own
-    thread (see UI_CMD_COND) rather than called from this Flask thread."""
+WINDOW_CLOSED = ("the app window is closed - restart the app to reopen it (your douyin "
+                 "session is saved in its profile), then retry")
+MANUAL_HINT = ("Extract the token manually in the app window: open a new tab, go to "
+               "www.douyin.com, close the login popup, click a video, close the login popup "
+               "again, let the video play a few seconds, then click 'Export cookies'. "
+               "If the window is closed, restart the app first.")
+
+
+def _write_cookies_txt(cookies):
+    lines = ["# Netscape HTTP Cookie File"] + [_playwright_cookie_line(c) for c in cookies]
+    cookies_path().write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(lines) - 1
+
+
+def _ui_cookies(timeout):
+    """Queue one Playwright call to the browser's own thread and return the cookies.
+    Playwright's sync API is thread-bound, so the call must run there, not on a Flask thread.
+    Raises CookieStaleError(WINDOW_CLOSED) if the window is gone."""
     with UI_LOCK:
         global UI_CONTEXT
         if UI_CONTEXT is None:
-            raise CookieStaleError(
-                "the app window is closed - restart the app to reopen it (your douyin "
-                "session is saved in its profile), then retry")
+            raise CookieStaleError(WINDOW_CLOSED)
         req = {"ready": threading.Event(), "result": None}
         with UI_CMD_COND:
             _ui_export_reqs.append(req)
             UI_CMD_COND.notify()
-        if not req["ready"].wait(timeout=15):
+        if not req["ready"].wait(timeout=timeout):
             UI_CONTEXT = None  # the browser thread is gone; don't keep probing a dead context
-            raise CookieStaleError("the app window is not responding - restart the app and retry")
+            raise CookieStaleError(WINDOW_CLOSED)
         res = req["result"]
     if isinstance(res, Exception):
-        UI_CONTEXT = None  # window closed while we were waiting
-        raise CookieStaleError(
-            "the app window is closed - restart the app to reopen it (your douyin "
-            "session is saved in its profile), then retry")
-    cookies = res
-    lines = ["# Netscape HTTP Cookie File"] + [_playwright_cookie_line(c) for c in cookies]
-    cookies_path().write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return len(lines) - 1
+        UI_CONTEXT = None  # a plain read failing usually means the window closed
+        raise res
+    return res
+
+
+def export_playwright_cookies():
+    """Pull cookies from the app's live UI browser via the Playwright API - no DB lock,
+    and immune to Edge/Chrome v20 app-bound encryption. Requires the window to be open."""
+    try:
+        cookies = _ui_cookies(15)
+    except CookieStaleError:
+        raise
+    except Exception:
+        raise CookieStaleError(WINDOW_CLOSED)
+    return _write_cookies_txt(cookies)
+
+
+def _goto(page, url):
+    page.goto(url, timeout=25000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
+    time.sleep(2)  # let the feed / login modal render
+
+
+def _spawned_pages(ctx, before, *keep):
+    """Pages in the window that weren't there before the ritual started and aren't
+    one of `keep` - i.e. login popup tabs the ritual spawned. Identified by the
+    snapshot diff (not URL), so odd-URL and late popups are caught too."""
+    return [p for p in ctx.pages if p not in before and p not in keep]
+
+
+def _close_pages(pages):
+    for p in pages:
+        try:
+            p.close()
+        except Exception:
+            pass
+
+
+def _dismiss_login(ctx, auto, ui_page, before, popups):
+    """Close douyin's login popup(s) - the tab that appears on landing and AGAIN when
+    clicking into a video - plus any in-page login modal."""
+    _close_pages(list(popups))
+    popups[:] = []
+    _close_pages(_spawned_pages(ctx, before, auto, ui_page))
+    try:
+        auto.keyboard.press("Escape")
+    except Exception:
+        pass
+    for sel in LOGIN_CLOSE_SEL:
+        try:
+            loc = auto.locator(sel).first
+            if loc.count() and loc.is_visible(timeout=300):
+                loc.click(timeout=1000)
+                break
+        except Exception:
+            pass
+
+
+def _click_video(page):
+    for sel in VIDEO_SEL:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible(timeout=1000):
+                loc.click(timeout=5000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _current_video_id(page):
+    """Best-effort id of a video on the page: from the playing <video> source, else
+    from any www.douyin.com/video/<id> reference in the DOM."""
+    try:
+        src = page.locator("video").first.evaluate("v => v.currentSrc || v.src || ''") or ""
+    except Exception:
+        src = ""
+    m = re.search(r"/(\d{15,20})", src)
+    if m:
+        return m.group(1)
+    m = re.search(r"/video/(\d{15,20})", page.content())
+    return m.group(1) if m else None
+
+
+def _enter_video(auto):
+    """Best-effort: get into a douyin VIDEO page (where ttwid + passport_csrf_token get
+    set). Returns True if one is reached. On /jingxuan there are no clickable anchors, so
+    fall back to the currently playing video's id (from the <video> src or any /video/<id>
+    in the DOM). Never raises - _run_ritual decides success from the cookies instead."""
+    if "/video/" in auto.url:
+        return True
+    if _click_video(auto):
+        try:
+            auto.wait_for_url(re.compile(r"/video/"), timeout=12000)
+            return True
+        except Exception:
+            pass
+    vid = _current_video_id(auto)
+    if vid:
+        try:
+            auto.goto(f"{DOUYIN_URL}video/{vid}", timeout=25000)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _wait_playing(page, settle=4):
+    """Wait for the video detail page and for playback to start, then let it run a
+    few seconds so douyin writes the session cookies."""
+    try:
+        page.wait_for_url(re.compile(r"/video/"), timeout=15000)
+    except Exception:
+        pass
+    try:
+        v = page.locator("video").first
+        v.wait_for(timeout=10000)
+        v.wait_for_function("el => el.currentTime > 0 && !el.paused", timeout=12000)
+    except Exception:
+        pass
+    time.sleep(settle)
+
+
+def _run_ritual(ctx, ui_page=None):
+    """Automate the manual douyin token ritual in a fresh tab: open douyin (lands on the
+    /jingxuan video feed, which plays a video), close login popups, get into a video page,
+    let it play. Runs on the browser's own thread only (in the app that's the
+    _open_ui_browser thread; in --extract-token, the subprocess's main thread). Success is
+    judged by the caller from the cookies it leaves behind. Popup tabs spawned by the
+    ritual are closed by snapshot diff, so login tabs get closed even if they open late
+    or with an unexpected URL. ui_page is optional: the app's UI page to keep open / bring
+    back to front (absent when run standalone)."""
+    before = set(ctx.pages)  # pages that exist before the ritual (ui page + user's tabs)
+    auto = ctx.new_page()
+    popups = []
+    auto.on("popup", lambda p: popups.append(p))
+    try:
+        try:
+            auto.bring_to_front()
+        except Exception:
+            pass
+        _goto(auto, DOUYIN_URL)
+        deadline = time.time() + 45  # douyin sets ttwid + passport_csrf_token on the feed itself
+        while time.time() < deadline:
+            _dismiss_login(ctx, auto, ui_page, before, popups)
+            if set(TOKEN_COOKIES) <= {c["name"] for c in ctx.cookies()}:
+                break  # the cookies we need are already set - no need to click into a video
+            if _enter_video(auto):
+                _wait_playing(auto, settle=2)
+                _dismiss_login(ctx, auto, ui_page, before, popups)
+                break
+            time.sleep(2)
+        _wait_playing(auto, settle=3)  # let playback run so douyin writes the session cookies
+        _dismiss_login(ctx, auto, ui_page, before, popups)
+    finally:
+        _close_pages(list(popups))
+        _close_pages(_spawned_pages(ctx, before, auto, ui_page))
+        try:
+            auto.close()
+        except Exception:
+            pass
+        if ui_page is not None:
+            try:
+                ui_page.bring_to_front()
+            except Exception:
+                pass
+
+
+def extract_token():
+    """Drive the douyin token ritual in a SEPARATE browser process - a clean environment,
+    unlike the app's own browser thread, which douyin's risk control keeps captcha-ing.
+    The child opens its own browser window, does the ritual, writes cookies.txt, exits.
+    On failure raises CookieStaleError with the child's error plus manual instructions."""
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}  # cp950 console would crash on any Chinese
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--extract-token"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise CookieStaleError(f"could not extract the token: timed out after 3 min - {MANUAL_HINT}")
+    out = (proc.stdout or "").strip()
+    if proc.stderr and proc.stderr.strip():
+        out += "\n" + proc.stderr.strip()
+    if proc.returncode != 0:
+        last = (out.splitlines() or ["no output"])[-1][:200]
+        raise CookieStaleError(f"could not extract the token: {last} - {MANUAL_HINT}")
+    m = re.search(r"ok: exported (\d+) cookies", proc.stdout or "")
+    return int(m.group(1)) if m else 0
+
+
+def extract_token_standalone():
+    """--extract-token entry: run the douyin ritual in a fresh dedicated browser (its own
+    persistent profile, so it never collides with the app window's .ui-profile) and write
+    the session cookies to cookies.txt. Same _run_ritual as before, but in a clean process
+    - douyin's risk control sees a normal browsing session, not the app's browser thread."""
+    from playwright.sync_api import sync_playwright
+    profile = str(Path(ui_profile_dir()).with_name(".token-profile"))
+    with sync_playwright() as p:
+        try:
+            ctx = p.chromium.launch_persistent_context(
+                profile, channel="msedge",
+                viewport={"width": 700, "height": 960},
+                ignore_default_args=["--enable-automation"],
+                args=["--disable-blink-features=AutomationControlled"])
+        except Exception:
+            ctx = p.chromium.launch_persistent_context(
+                profile, viewport={"width": 700, "height": 960},
+                ignore_default_args=["--enable-automation"],
+                args=["--disable-blink-features=AutomationControlled"])
+        try:
+            _run_ritual(ctx)
+            cookies = ctx.cookies()
+            if not set(TOKEN_COOKIES) <= {c["name"] for c in cookies}:
+                raise RuntimeError(f"visited douyin but {TOKEN_COOKIES} were not set")
+            return _write_cookies_txt(cookies)
+        finally:
+            ctx.close()
 
 
 def export_cookies(browser):
@@ -219,9 +456,9 @@ def _cookie_hint(e, browser):
                 "Use 'playwright (app window)' instead: open www.douyin.com in the app "
                 "window, then download - cookies are read live, no decryption needed.")
     if browser == "playwright":
-        return ("Restart the app to reopen its window, open a douyin video page there "
-                "(no login needed; ttwid + passport_csrf_token are set on video pages), "
-                "then click 'Export cookies' and retry.")
+        return ("Restart the app to reopen its window, then click 'Extract token' "
+                "(it opens a douyin video page automatically) or open one manually, "
+                "then 'Export cookies'.")
     return "Close the browser and click 'Export cookies', or untick 'use cookies'."
 
 
@@ -525,6 +762,17 @@ def api_cookies_export():
                         "message": f"{_short_err(e)} — {_cookie_hint(e, browser)}"}), 400
 
 
+@app.post("/api/cookies/extract-token")
+def api_extract_token():
+    """Automate the douyin token ritual in a separate browser process (see extract_token),
+    then export fresh cookies. On failure, ask the user to do the ritual manually."""
+    try:
+        n = extract_token()
+        return jsonify({"ok": True, "message": f"Extracted fresh token - exported {n} cookies"})
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+
+
 def _selftest():
     sample = ("5.30 :5pm MWZ:/ 03/16 E@u.SY 无语  "
               "https://v.douyin.com/Oa6WLk8qJuc/ 复制此链接，打开Dou音搜索，直接观看视频！")
@@ -560,6 +808,9 @@ def _selftest():
     assert "app-bound" in dpapi and "playwright" in dpapi, dpapi
     assert "Close the browser" in _cookie_hint(Exception("x"), "edge")
     assert "Restart the app" in _cookie_hint(Exception("x"), "playwright")
+    assert "Extract token" in _cookie_hint(Exception("x"), "playwright")
+    assert "manually" in MANUAL_HINT and "'Export cookies'" in MANUAL_HINT
+    assert set(TOKEN_COOKIES) == {"ttwid", "passport_csrf_token"}
     print("selftest ok")
 
 
@@ -640,6 +891,15 @@ def _already_running():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _selftest()
+        sys.exit(0)
+    if "--extract-token" in sys.argv:
+        try:
+            n = extract_token_standalone()
+            print(f"ok: exported {n} cookies")
+        except Exception as e:
+            print(f"ERROR: {_short_err(e)}")
+            print(MANUAL_HINT)
+            sys.exit(1)
         sys.exit(0)
     if "--export-cookies" in sys.argv:
         browser = sys.argv[sys.argv.index("--export-cookies") + 1] if len(sys.argv) > sys.argv.index("--export-cookies") + 1 else "opera"
