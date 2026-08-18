@@ -19,6 +19,11 @@
   button { padding:7px 14px; border:1px solid var(--line); border-radius:6px; background:#fff; cursor:pointer; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
   button.mini { padding:2px 8px; font-size:12px; }
+  button:disabled { opacity:.6; cursor:default; }
+  button.loading::before { content:''; display:inline-block; width:12px; height:12px;
+    border:2px solid rgba(255,255,255,.4); border-top-color:#fff; border-radius:50%;
+    animation:spin .6s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   .row { display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap; }
   .muted { color:var(--muted); font-size:12px; }
   .url-list .row input { flex:1; min-width:200px; }
@@ -79,8 +84,8 @@
   </div>
   <div class="row">
     <span class="muted" id="cookieStatus">checking cookies…</span>
-    <button id="extractToken" class="primary">Extract token</button>
-    <button id="exportCookies">Export cookies</button>
+    <button id="extractToken" class="primary">Auto cookies export</button>
+    <button id="exportCookies" hidden>Export cookies</button>
   </div>
   <p class="muted" id="cookieNote"></p>
 </div>
@@ -310,10 +315,10 @@ $('histDate').onchange = loadHistory;
 
 $('cookieNote').textContent =
   'How cookies work: real browsers (opera/edge/chrome) must be CLOSED to export their cookies (Chromium '
-  + 'locks the DB while running). "Extract token" automates the douyin ritual in a separate browser window '
+  + 'locks the DB while running). "Auto cookies export" automates the douyin ritual in a separate browser window '
   + '(opens a video, closes login popups, lets it play) then exports - no login needed; ttwid + '
-  + 'passport_csrf_token are only set on video pages. "Export cookies" reads them as-is. If auto-extraction '
-  + 'fails, it prints the manual steps to follow instead.';
+  + 'passport_csrf_token are only set on video pages. If it fails, the manual "Export cookies" button '
+  + 'appears - it reads the app window\'s cookies as-is and prints the manual steps to follow.';
 
 async function refreshCookies() {
   const s = await api('/api/cookies/status');
@@ -323,10 +328,17 @@ async function refreshCookies() {
 }
 
 $('extractToken').onclick = async () => {
+  const btn = $('extractToken');
+  btn.disabled = true; btn.classList.add('loading');
   $('cookieStatus').textContent = 'running douyin token extraction… (a douyin window will open)';
-  const r = await api('/api/cookies/extract-token', { method: 'POST' });
-  $('cookieStatus').textContent = (r.ok ? '✓ ' : '✗ ') + r.message;
-  if (r.ok) refreshCookies();
+  try {
+    const r = await api('/api/cookies/extract-token', { method: 'POST' });
+    $('cookieStatus').textContent = (r.ok ? '✓ ' : '✗ ') + r.message;
+    if (!r.ok) $('exportCookies').hidden = false;
+    else refreshCookies();
+  } finally {
+    btn.disabled = false; btn.classList.remove('loading');
+  }
 };
 
 $('exportCookies').onclick = async () => {
